@@ -1,5 +1,7 @@
 # Energy Price Modelling
 
+Full project available as a PDF:
+https://github.com/RMCox/Energy-Price-Prediction/blob/master/Energy_Price_Prediction.pdf
 
 Time Series Analysis in R. Used Generalised Additive Models (GAMs) to predict energy prices on the energy futures markeet, and choose an optimal strategy to minimise costs for an energy supplier.
 
