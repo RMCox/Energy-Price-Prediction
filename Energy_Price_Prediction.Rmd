@@ -1,0 +1,1322 @@
+---
+title: "Energy Price Prediction"
+output:
+  pdf_document: default
+  html_notebook: default
+---
+
+
+```{r, echo=FALSE}
+if (!require("tidyverse")) install.packages("tidyverse")
+if (!require("mgcv")) install.packages("mgcv")
+if (!require("readxl")) install.packages("readxl")
+if (!require("xts")) install.packages("xts")
+if (!require("GGally")) install.packages("GGally")
+if (!require("caret")) install.packages("caret")
+if (!require("gratia")) install.packages("gratia")
+if (!require("lubridate")) install.packages("lubridate")
+
+library(GGally)
+library(tidyselect)
+library(mgcv)
+library(readxl)
+library(xts)
+library(caret)
+library(gratia)
+library(lubridate)
+
+```
+# Energy Price Prediction: Determining a Strategy to Purchase Energy
+
+
+# Part 1: Data with Forecast Demand and Wind Variables
+
+### Project assumptions:  
+* The client's company's market activity will not affect the market  
+* There will always be sufficient energy available for purchase  
+* The client has no limits on capital to spend at any given hour    
+* Prices are released/available at the time of or during auction periods  
+
+### Loading Data
+
+Reading in the data provided
+```{r}
+path <- "QUB Data - Part 1.xlsx"
+
+excel_1 <- path %>% 
+  excel_sheets() %>% 
+  set_names() %>% 
+  map(read_excel, path = path)
+```
+
+inspecting each tab in the data (wind)
+```{r}
+excel_1$Wind
+```
+
+inspecting each tab in the data (demand)
+```{r}
+excel_1$Demand
+```
+
+inspecting each tab in the data (actual prices)
+```{r}
+excel_1$`Actual Prices`
+```
+
+Joining data into one dataframe
+```{r}
+df <- inner_join(excel_1$Wind, excel_1$Demand, by=c("Start Date"="Start Date", "Start Time 30 Minute Period" = "Start Time 30 Minute Period")) %>%
+  inner_join(excel_1$`Actual Prices`, by=c("Start Date"="Start Date", "Start Time 30 Minute Period" = "Time"))
+names
+df
+
+# renaming for simplicity
+names(df) <-  c("Start_Date", "Start_Time_30_Minute_Period", "Actual_Wind_MW", "DAM_Forecast_ISEMWIND", "IDA1_Forecast_ISEMWIND", "IDA2_Forecast_ISEMWIND", "IDA3_Forecast_ISEMWIND", "Actual_Demand_MW", "DAM_Forecast_ISEMDEMAND_FC_at_10am_D_1", "IDA1_Forecast_ISEMDEMAND", "IDA2_Forecast_ISEMDEMAND", "IDA3_Forecast_ISEMDEMAND", "DA_Price", "IDA1_Price", "IDA2_Price", "IDA3_Price", "BM_Price")
+```
+
+Checking when prices are available for each auction period: "1" signifies that a price is available. We can see the DA price, IDA1 Price and BM price are always available, while IDA2 price is available from 11:00 to 22:30 inclusive, IDA3 price is available from 17:00 to 22:30 inclusive.  
+This is in line with the description of the data given in advance.
+```{r}
+names(df)
+times_of_day = unique(df %>% select(Start_Time_30_Minute_Period)) %>% data.frame()
+names(df)
+DA_Price_Available <- unique(df %>% filter(!is.na(DA_Price)) %>% select(Start_Time_30_Minute_Period)) %>% mutate("DA_Price_Available" = 1)
+IDA1_Price_Available <- unique(df %>% filter(!is.na(IDA1_Price)) %>% select(Start_Time_30_Minute_Period)) %>% mutate("IDA1_Price_Available" = 1)
+IDA2_Price_Available <- unique(df %>% filter(!is.na(IDA2_Price)) %>% select(Start_Time_30_Minute_Period)) %>% mutate("IDA2_Price_Available" = 1)
+IDA3_Price_Available <- unique(df %>% filter(!is.na(IDA3_Price)) %>% select(Start_Time_30_Minute_Period)) %>% mutate("IDA3_Price_Available" = 1)
+BM_Price_Available <- unique(df %>% filter(!is.na(BM_Price)) %>% select(Start_Time_30_Minute_Period)) %>% mutate("BM_Price_Available" = 1)
+
+
+times_of_day %>% full_join(DA_Price_Available, by=c("Start_Time_30_Minute_Period"="Start_Time_30_Minute_Period")) %>%
+  full_join(IDA1_Price_Available, by=c("Start_Time_30_Minute_Period"="Start_Time_30_Minute_Period")) %>% 
+  full_join(IDA2_Price_Available, by=c("Start_Time_30_Minute_Period"="Start_Time_30_Minute_Period")) %>% 
+  full_join(IDA3_Price_Available, by=c("Start_Time_30_Minute_Period"="Start_Time_30_Minute_Period")) %>% 
+  full_join(BM_Price_Available, by=c("Start_Time_30_Minute_Period"="Start_Time_30_Minute_Period"))
+  
+
+```
+
+manipulating dataframe to have a time compatible with POSIXCT format
+```{r}
+df$Start_Date <- df$Start_Date %>% str_replace_all("/", "-")
+df$joined_time <- paste(df$Start_Date, df$Start_Time_30_Minute_Period)
+
+df <- df %>% select(-Start_Date, -Start_Time_30_Minute_Period)
+
+df$joined_time <- as.character(df$joined_time)
+
+head(df)
+```
+### Dealing with missing values
+Brief check for outliers - we can see one value of demand at zero, which seems very unlikely
+```{r}
+summary(df$Actual_Demand_MW)
+boxplot(df$Actual_Demand_MW)
+```
+
+Replacing the zero vaue with the average value for the two adjacent time stamps
+```{r}
+df[df$Actual_Demand_MW == 0, ]
+
+avg <- (df$Actual_Demand_MW[df$joined_time == "11-04-2019 05:00:00"]+df$Actual_Demand_MW[df$joined_time == "11-04-2019 06:00:00"])/2
+
+df[df$joined_time == "11-04-2019 05:30:00",]$Actual_Demand_MW <- avg
+
+df[df$joined_time == "11-04-2019 05:30:00",]$demand_wind_diff <- avg -df[df$joined_time == "11-04-2019 05:30:00",]$Actual_Wind_MW
+
+df[df$joined_time == "11-04-2019 05:30:00",]
+
+
+```
+
+
+### EDA
+
+Boxplots reveal that BM prices have the lowest mean value but by far the most variance.  
+BM can also be seen to have many high and low outliers, some values even being negative, as energy producers pay for companies to buy their energy to avoid energy overload.  
+The DA and IDA prices have slightly lower means than IDA 2 and IDA 3, and all options except for BM appear to have a larger number of high number of high outlier  
+```{r}
+summary(df, fig.width=20, fig.height=20)
+df_stacked <- stack(df, select = c(DA_Price, IDA1_Price, IDA2_Price, IDA3_Price, BM_Price))
+ggplot(df_stacked, aes(ind, values, col=ind)) + geom_boxplot()
+
+
+```
+The spread of the data can be seen with a density plot, the right skew is apparent across many markets
+```{r, fig.width=20, fig.height=5}
+ggplot(df_stacked, aes(x=values, group=ind, fill=ind)) + geom_density(alpha=0.2)
+```
+
+The value distributions can be seen more easily using histograms. There are fewer IDA2 and IDA3 prices available (as these are only available for certain hours). BM is seen to have the most variance, All variables have unimodal distributions, with the mossible exception of BM that has a small peak at zero
+```{r, fig.width=10, fig.height=5}
+ggplot(df_stacked, aes(x=values, group=ind, fill=ind)) + geom_histogram(bins=100) + facet_wrap(.~ind)
+```
+
+### Creating XTS object
+
+There is a 30 minute periodicity
+```{r}
+main_xts <- xts(df[,-16], as.POSIXct(df[,16][[1,]], format="%d-%m-%Y %H:%M:%S")) # using the datetime column as an index before dropping the redundant column
+print(periodicity(main_xts))
+print(names(main_xts))
+head(main_xts)
+```
+
+
+### Visualing with XTS
+We can see all the actual prices over time for a short period  
+We can see the large variance of the BM price, and the limited availability of IDA2 and IDA3 prices
+```{r fig.width=20, fig.height=6, echo=FALSE}
+names(main_xts)
+autoplot.zoo(main_xts[, c("BM_Price", "IDA1_Price", "IDA2_Price", "IDA3_Price", "DA_Price")]["2019-03-/2019-04-02"], plot.type = "single", facets = NULL )
+```
+
+Over the entire period we can see the spikes in the BM price, often going negative, but there is too much detail to see trends
+```{r fig.width=20, fig.height=6, echo=FALSE}
+autoplot.zoo(main_xts[, c("BM_Price", "IDA1_Price", "IDA2_Price", "IDA3_Price", "DA_Price")], plot.type = "single", facets = NULL )
+```
+
+Creating rolling average reveals trends slightly better, the prices tend to follow each other reasonably closely, though the BM price is much more volatile.  
+The price average also appears relatively stationary over the period, with a slight downward trend
+```{r fig.width=20, fig.height=6}
+names(main_xts)
+main_xts$BM_Price_Rolling <- rollmean(main_xts[,"BM_Price"], 30)
+main_xts$IDA1_Price_Rolling <- rollmean(main_xts[,"IDA1_Price"], 30)
+main_xts$IDA2_Price_Rolling <- rollmean(main_xts[,"IDA2_Price"], 30)
+main_xts$IDA3_Price_Rolling <- rollmean(main_xts[,"IDA3_Price"], 30)
+main_xts$DA_Price_Rolling <- rollmean(main_xts[,"DA_Price"], 30)
+
+autoplot.zoo(main_xts[, c("DA_Price_Rolling", "IDA1_Price_Rolling", "IDA2_Price_Rolling", "IDA3_Price_Rolling", "BM_Price_Rolling")], plot.type = "single", facets = NULL)
+```
+
+### EDA in Preperation for Modelling
+
+All relationships between prices are positively correlated, and are stronger between "closer" price measurements, e.g. DAM and IDA 1 and highly correlated, DAM and BM are slightly correlated
+```{r, warning=FALSE, fig.width=5, fig.height=5}
+ggpairs(main_xts[, c("DA_Price", "IDA1_Price", "IDA2_Price", "IDA3_Price", "BM_Price")], title = "Relationships between Price Types", alpha=0.01)
+```
+
+Adding a number of variables using lag:
+* the index of the time; the number of half hour periods passed. This should account for the downward trend in energy prices over time  
+* The average price 24 hours before the energy hour - to see if prices are dependent on previous prices in the short term.  
+* The average of the previous 7 days of available prices - to see if prices are dependent on previous prices in the slightly longer term.  
+Some of these variables may be related to sentiment. Logically or illogically, there may be more willingness to pay a certain price if the previous day or days of prices have been relatively high. Businesses may also hold out on projects that require large amount of energy in the hopes of paying a lower price, and when a satisfactory price reveals itself, demand may rise, which could affect the pricing structure
+```{r}
+main_xts$time_index_half_hour_periods <- index(index(main_xts))
+main_xts$mean_all_prices <- rowMeans(main_xts[,c('DA_Price', 'IDA1_Price', 'IDA2_Price', 'IDA3_Price', 'BM_Price')], na.rm=TRUE)
+main_xts$prev_day_av_price <- lag(main_xts$mean_all_prices, 48L)
+main_xts$prev_day_av_price[1:48] <- main_xts$mean_all_prices[1:48] # unknown previous day's average price for first day of data, so just using mean
+
+main_xts$prev_week_av_price <- rollapply(as.zoo(main_xts$prev_day_av_price), 48*7, mean, partial = TRUE, align = "right") # average of last 7 days of available prices, (ignoring the previous day since those prices will not be available)
+
+main_xts <- xts(main_xts, as.POSIXct(df[,16][[1,]], format="%d-%m-%Y %H:%M:%S")) # have to remake the XTS as the rollapply resets te index
+```
+
+
+Checking relationships between wind, demand and prices    
+Taking the mean price (mean price of all energy markets) and plotting against wind and demand reveals correlations:  
+* Demand positively correlated with price
+* Wind negatively correlated with price  
+* Wind positively correlated with demand - wind being stronger likely lowers energy prices, which would increase demand where energy purchase is optional      
+* Time negatively correlated with price - energy is getting cheaper as time goes on - it should be noted that cannot be a linear relationship, energy companies won't provide free energy given enough years
+* Time negatively correlated with demand - demand for energy is falling slightly over the period    
+    
+A linear model is clearly not desireable, particularly given the non linear relationship of time and the issues this would cause.  
+```{r, warning=FALSE, fig.width=6, fig.height=6}
+ggpairs(main_xts[, c("mean_all_prices", "Actual_Wind_MW", "Actual_Demand_MW")], title = "Relationships between Wind, Demand and Mean Price")
+```
+
+
+Now checking the relationships between the wind and demand forecasts and price, rather than actual wind and actual demand  
+It would be expected that if the forecasts are a good predictor of the actual wind and demand, the correlations and shape of distributions would be very similar, which they are. Since the wind and demand forecasts will be available, these will be used to predict prices.  
+```{r, warning=FALSE, fig.width=6, fig.height=6}
+names(main_xts)
+ggpairs(main_xts[, c("mean_all_prices", "DAM_Forecast_ISEMWIND", "DAM_Forecast_ISEMDEMAND_FC_at_10am_D_1"), title="Relationships betwen Forecast Wind, Forecast Demand and Mean Price"])
+```
+
+
+### Train/Test Split
+Splitting the data into train and test sets, both as xts objects and as dataframes  
+The dataframes are for ease when using GAMs
+
+```{r}
+set.seed(42)
+sum(is.na(main_xts$Actual_Wind_MW)) # checking we can use "actual wind" column as the data partition (sum of NA should be 0)
+in_train <- createDataPartition(main_xts$Actual_Wind_MW, p=0.6, list = FALSE) # split is 60% to 40% and is randomly shuffled
+main_xts_train <- main_xts[in_train,]
+main_xts_test <- main_xts[-in_train,]
+
+train_df <- data.frame(main_xts_train)
+test_df <- data.frame(main_xts_test)
+```
+
+
+### Modelling Prices with GAMs: Example
+
+Generalised Additive Models (GAMs) will be used to model prices. Their main advantages for this problem is their ability to capture nonlinear relationships between explanatory variables and prices, the ability to use large numbers of explanatory variables, and the ability to distinguish explanatory variables which are significant from those which are not.    
+  
+In a basic example, a GAM can be used to predict DAM Price with the wind and demand forecast variables, and the time index.  
+All variables are significant predictors, as can be seen by their extremely low p-values  
+However, the R Squared Adjusted value, which is the percentage of variance explained by the model, adjusted for the number of explanatory variables, is quite low at 62%. 
+```{r warning=FALSE, fig.width=20, fig.height=6}
+gam_DAM <- gam(`DA_Price` ~ s(`DAM_Forecast_ISEMWIND`) + s(`DAM_Forecast_ISEMDEMAND_FC_at_10am_D_1`) + s(time_index_half_hour_periods), data=train_df)
+summary(gam_DAM)
+```
+
+We can also see that the gam is quite weak when predicting high values, residuals are not normally distributed, significant right skew
+```{r}
+appraise(gam_DAM)
+```
+
+To achieve a higher R Squared value, A new GAM with extra lag variables that were added previously can be used. This achieves an R Squared Adjusted valueof 67%.
+```{r warning=FALSE, fig.width=20, fig.height=6}
+gam_DAM <- gam(`DA_Price` ~ s(`DAM_Forecast_ISEMWIND`) + s(`DAM_Forecast_ISEMDEMAND_FC_at_10am_D_1`) + s(prev_week_av_price) + s(prev_day_av_price) + s(time_index_half_hour_periods), data=train_df)
+# keep this - not sure
+# main_xts_2$gam_DAM_predictions <-  c(NA, NA, NA, NA, NA, NA, NA, predict(gam_DAM_2)) # <- 7 days delay on the rolling mean so need 7 days NA at start
+summary(gam_DAM)
+```
+
+
+Using the GAM to predict DAM values in the testing data.  
+The accuracy is 68%, which is moderately good.  
+```{r}
+predictions_DAM <- predict(gam_DAM, newdata = test_df)
+main_xts_test$predictions_DAM <- predictions_DAM
+
+rsq <- function (x, y) cor(x, y) ^ 2
+rsq(x = main_xts_test$predictions_DAM, main_xts_test$DA_Price) 
+
+```
+
+
+Showing plots of the GAM for each variable
+```{r}
+plot(gam_DAM, se=TRUE, shade=TRUE, shade.col = "rosybrown2")
+```
+
+
+Plots are slightly better, but still some issues with non normal residuals
+```{r}
+appraise(gam_DAM)
+```
+Plot of the test values over a short period, we can see the predicted values following the true values quite closely
+```{r fig.width=20, fig.height=6, echo=FALSE}
+autoplot.zoo(main_xts_test[, c("DA_Price", "predictions_DAM")]["2019-03-/2019-04-"], plot.type = "single", facets = NULL)
+```
+
+### Model Consideration : Price Interdependency
+
+It would be a simple enough task to generate Generalised Additive Models for each market group, and choose to buy from the group with the lowest predicted price.  
+However, this would ignore one key factor; that the price of each market are interdependent.  
+   
+Running the summary of a GAM to predict the price of IDA1 based on the most recent wind and demand forecasts at the time, the mean prices over the previous 7 days, and the mean price on the previous day, results in an R Squared Adjusted value of 64%
+
+```{r warning=FALSE, fig.width=20, fig.height=6}
+IDA1_GAM <- gam(`IDA1_Price` ~ s(`DAM_Forecast_ISEMWIND`) + s(`DAM_Forecast_ISEMDEMAND_FC_at_10am_D_1`) + s(prev_week_av_price) + s(prev_day_av_price) + s(time_index_half_hour_periods), data=train_df)
+summary(IDA1_GAM)
+```
+
+
+However, when the DA price, which is made available shortly after the DA auction and would be available before the IDA1 price is known, is used as an explanatory variable, the R Squared Adjusted value of 92%  
+This is a significant improvement, and the DA price can be seen by the p-value to be a highly significant explanatory variable
+```{r}
+IDA1_GAM <- gam(`IDA1_Price` ~ s(`DA_Price`) + s(`DAM_Forecast_ISEMWIND`) + s(`DAM_Forecast_ISEMDEMAND_FC_at_10am_D_1`) + s(prev_week_av_price) + s(prev_day_av_price) + s(time_index_half_hour_periods), data=train_df)
+summary(IDA1_GAM)
+```
+
+This relationship could be explained by many factors. It may be that demand for later prices changes upon seeing earlier prices, or it may be a psychological phenomenon that low previous prices cause an expectation of lower future prices, causing a build up of demand for those later prices which might inflate the price.   
+Whatever the reason, it is clear that the prices are interdependent and should be factored into any predictive models.  
+
+### Modelling Strategy
+
+Given that previous prices may often be strong explanatory variables in predicting future prices, the process for implementing a pricing strategy for each half-hour energy period would the iterative method described as follows.  
+  
+  For each market in order:  
+  prior to each price release  
+  Predict all remaning prices using any prices released after auction, the explanatory variables and most recent forecasts, including IDA2 and IDA3 if available for that half-hour  
+  If the upcoming market is predicted to be the cheapest, choose that market for energy purchase  
+  If not, update the model with the actual price once it becomes available, and repeat  
+
+The process is described fully below:
+  
+* stage 1: 
+  + Prior to the DAM Auction, use the lagged variables and the most recent forecasts to predict all prices (including IDA2 and IDA3 if they will be available)
+  + if the DAM price is predicted to be the lowest price, buy the DAM price at auction
+* stage 2:
+  + Use actual DAM price once available after auction, the lagged variables and the newest most recent forecasts to predit all remaining prices (including IDA2 and IDA3 if they will be available)
+  + if the IDA1 price is predicted to be the lowest price, buy the IDA1 price at auction
+* stage 3:
+  + Use actual IDA1 price once available after auction, the lagged variables and the newest most recent forecasts to predit all remaining prices (including IDA2 and IDA3 if they will be available)
+  + if the IDA2 price is predicted to be the lowest price, buy the IDA2 price at auction (if IDA2 price is not used, do not predict)
+  * stage 4:
+  + Use actual IDA2 price (if avaialable for the hour) once available after auction, the lagged variables and the newest most recent forecasts to predit all remaining prices (including IDA3 if it will be available)
+  + if the IDA3 price is predicted to be the lowest price, buy the IDA3 price at auction (if IDA3 price is not used, do not predict)
+  * stage 5:
+  + buy at BM rate if all other prices have not been selected
+
+
+Defining all the GAMs required for this process 
+```{r}
+names(train_df)
+
+# This is what you would expect to use for the GAMs: all the available price information, the most recent forecasts, the average price over the last 7 days, the previous day's average price and the time index
+# however performing a summary reveals that many of these variables can be removed
+# ----------------------------------
+
+gam_DAM_stage1 <- gam(DA_Price ~ s(DAM_Forecast_ISEMWIND) + s(`DAM_Forecast_ISEMDEMAND_FC_at_10am_D_1`) + s(prev_week_av_price) + s(prev_day_av_price) + s(time_index_half_hour_periods), data=train_df)
+gam_IDA1_stage1 <- gam(IDA1_Price ~ s(DAM_Forecast_ISEMWIND) + s(DAM_Forecast_ISEMDEMAND_FC_at_10am_D_1) + s(prev_week_av_price) + s(prev_day_av_price) + s(time_index_half_hour_periods), data=train_df)
+gam_IDA2_stage1 <- gam(IDA2_Price ~ s(DAM_Forecast_ISEMWIND) + s(DAM_Forecast_ISEMDEMAND_FC_at_10am_D_1) + s(prev_week_av_price) + s(prev_day_av_price) + s(time_index_half_hour_periods), data=train_df)
+gam_IDA3_stage1 <- gam(IDA3_Price ~ s(DAM_Forecast_ISEMWIND) + s(DAM_Forecast_ISEMDEMAND_FC_at_10am_D_1) + s(prev_week_av_price) + s(prev_day_av_price) + s(time_index_half_hour_periods), data=train_df)
+gam_BM_stage1 <- gam(BM_Price ~ s(DAM_Forecast_ISEMWIND) + s(DAM_Forecast_ISEMDEMAND_FC_at_10am_D_1) + s(prev_week_av_price) + s(prev_day_av_price) + s(time_index_half_hour_periods), data=train_df)
+
+gam_IDA1_stage2 <- gam(IDA1_Price ~ s(DA_Price) + s(IDA1_Forecast_ISEMWIND) + s(IDA1_Forecast_ISEMDEMAND) + s(prev_week_av_price) + s(prev_day_av_price) + s(time_index_half_hour_periods), data=train_df)
+gam_IDA2_stage2 <- gam(IDA2_Price ~ s(DA_Price) + s(IDA1_Forecast_ISEMWIND) + s(IDA1_Forecast_ISEMDEMAND) + s(prev_week_av_price) + s(prev_day_av_price) + s(time_index_half_hour_periods), data=train_df)
+gam_IDA3_stage2 <- gam(IDA3_Price ~ s(DA_Price) + s(IDA1_Forecast_ISEMWIND) + s(IDA1_Forecast_ISEMDEMAND) + s(prev_week_av_price) + s(prev_day_av_price) + s(time_index_half_hour_periods), data=train_df)
+gam_BM_stage2 <- gam(BM_Price ~ s(DA_Price) + s(IDA1_Forecast_ISEMWIND) + s(IDA1_Forecast_ISEMDEMAND) + s(prev_week_av_price) + s(prev_day_av_price) + s(time_index_half_hour_periods), data=train_df)
+
+gam_IDA2_stage3 <- gam(IDA2_Price ~ s(DA_Price) + s(IDA1_Price) + s(IDA2_Forecast_ISEMWIND) + s(IDA2_Forecast_ISEMDEMAND) + s(prev_week_av_price) + s(prev_day_av_price) + s(time_index_half_hour_periods), data=train_df)
+gam_IDA3_stage3 <- gam(IDA3_Price ~ s(DA_Price) + s(IDA1_Price) + s(IDA2_Forecast_ISEMWIND) + s(IDA2_Forecast_ISEMDEMAND) + s(prev_week_av_price) + s(prev_day_av_price) + s(time_index_half_hour_periods), data=train_df)
+gam_BM_stage3 <- gam(BM_Price ~ s(DA_Price) + s(IDA1_Price) + s(IDA1_Forecast_ISEMWIND) + s(IDA1_Forecast_ISEMDEMAND) +  s(prev_week_av_price) + s(prev_day_av_price) + s(time_index_half_hour_periods), data=train_df) # BM cannot use IDA2 and IDA3 variables here since it will create NAs when BM price should be available for prediction
+
+gam_IDA3_stage4 <- gam(IDA3_Price ~ s(DA_Price) +s (IDA1_Price) + s(IDA2_Price) + s(IDA3_Forecast_ISEMWIND) + s(IDA3_Forecast_ISEMDEMAND) + s(prev_week_av_price) + s(prev_day_av_price) + s(time_index_half_hour_periods), data=train_df)
+gam_BM_stage4 <- gam(BM_Price ~ s(DA_Price) +s(IDA1_Price) + s(IDA1_Forecast_ISEMWIND) + s(IDA1_Forecast_ISEMDEMAND) + s(prev_week_av_price) + s(prev_day_av_price) + s(time_index_half_hour_periods), data=train_df) # BM cannot use IDA2 and IDA3 variables here since the GAM will create NAs when BM price should be available for prediction
+
+gam_BM_stage5 <- gam(BM_Price ~ s(DA_Price) + s(IDA1_Price) + s(IDA1_Forecast_ISEMWIND) + s(IDA1_Forecast_ISEMDEMAND) + s(prev_week_av_price) + s(prev_day_av_price) + s(time_index_half_hour_periods), data=train_df) # BM cannot use IDA2 and IDA3 variables here since the GAM will create NAs when BM price should be available for prediction
+
+# ----------------------------------
+# checking to see if there are any varaibles that are not significant in each GAM
+
+summary(gam_DAM_stage1)
+summary(gam_IDA1_stage1)
+summary(gam_IDA2_stage1)
+summary(gam_IDA3_stage1)
+summary(gam_BM_stage1)
+
+summary(gam_IDA1_stage2)
+summary(gam_IDA2_stage2)
+summary(gam_IDA3_stage2)
+summary(gam_BM_stage2)
+
+summary(gam_IDA2_stage3)
+summary(gam_IDA3_stage3)
+summary(gam_BM_stage3)  # DA_Price insignificant
+
+summary(gam_IDA3_stage4) # IDA3_Forecast_ISEMDEMAND
+summary(gam_BM_stage4) # DA_Price insignificant
+
+summary(gam_BM_stage5) # DA_Price insignificant
+
+# ----------------------------------
+# redefining some of the GAMs using only their significant variables
+
+gam_BM_stage3 <- gam(BM_Price ~  s(IDA1_Price) + s(IDA1_Forecast_ISEMWIND) + s(IDA1_Forecast_ISEMDEMAND) +  s(prev_week_av_price) + s(prev_day_av_price) + s(time_index_half_hour_periods), data=train_df) # BM cannot use IDA2 and IDA3 variables here since it will create NAs when BM price should be available for prediction
+
+gam_IDA3_stage4 <- gam(IDA3_Price ~ s(DA_Price) +s (IDA1_Price) + s(IDA2_Price) + s(IDA3_Forecast_ISEMWIND) + s(prev_week_av_price) + s(prev_day_av_price) + s(time_index_half_hour_periods), data=train_df)
+gam_BM_stage4 <- gam(BM_Price ~ s(IDA1_Price) + s(IDA1_Forecast_ISEMWIND) + s(IDA1_Forecast_ISEMDEMAND) + s(prev_week_av_price) + s(prev_day_av_price) + s(time_index_half_hour_periods), data=train_df) # BM cannot use IDA2 and IDA3 variables here since the GAM will create NAs when BM price should be available for prediction
+
+gam_BM_stage5 <- gam(BM_Price ~  s(IDA1_Price) + s(IDA1_Forecast_ISEMWIND) + s(IDA1_Forecast_ISEMDEMAND) + s(prev_week_av_price) + s(prev_day_av_price) + s(time_index_half_hour_periods), data=train_df) # BM cannot use IDA2 and IDA3 variables here since the GAM will create NAs when BM price should be available for prediction
+
+
+# all variables are now significant 
+summary(gam_DAM_stage1)
+summary(gam_IDA1_stage1)
+summary(gam_IDA2_stage1)
+summary(gam_IDA3_stage1)
+summary(gam_BM_stage1)
+
+summary(gam_IDA1_stage2)
+summary(gam_IDA2_stage2)
+summary(gam_IDA3_stage2)
+summary(gam_BM_stage2)
+
+summary(gam_IDA2_stage3)
+summary(gam_IDA3_stage3)
+summary(gam_BM_stage3)
+
+summary(gam_IDA3_stage4)
+summary(gam_BM_stage4)
+
+summary(gam_BM_stage5)
+```
+
+Defining 2 functions  
+The first function takes an xts object, and will create all the explanatory variables used to predict  
+It will also make the prediction, using variables and previous prices, and will also ensure that energy half-hour periods that should not have an associated IDA2 or IDA3 value, have a NULL value places in their respective columns
+```{r, warning=FALSE}
+
+prepare_dataframe <- function(xts_object){
+  xts_totest <- xts_object
+  xts_totest$time_index_half_hour_periods <- index(index(xts_totest))
+  xts_totest$mean_all_prices <- rowMeans(xts_totest[,c('DA_Price', 'IDA1_Price', 'IDA2_Price', 'IDA3_Price', 'BM_Price')], na.rm=TRUE)
+  xts_totest$prev_day_av_price <- lag(xts_totest$mean_all_prices, 48L)
+  xts_totest$prev_day_av_price[1:48] <- xts_totest$mean_all_prices[1:48] # unknown previous day's average price for first day of data, so just using mean
+  xts_totest$prev_week_av_price <- rollapply(as.zoo(xts_totest$prev_day_av_price), 48*7, mean, partial = TRUE, align = "right") # average of last 7 days of available prices, (ignoring the previous day since those prices will not be available)
+  
+# make a dataframe (for GAMs basically)
+df_totest <- data.frame(xts_totest)
+df_totest$date_time <- index(xts_totest) # important to make this row or can't use ifelse when making predictions to put NULL in for certain hours
+
+xts_totest <- xts(xts_totest, as.POSIXct(df_totest$date_time, format="%d-%m-%Y %H:%M:%S")) # have to remake the XTS as the rollapply resets te index
+# make columns first
+xts_totest$DAM_stage_1_prediction <- predict(gam_DAM_stage1, newdata = df_totest)
+xts_totest$IDA_1_stage_1_prediction <- predict(gam_IDA1_stage1, newdata = df_totest)
+xts_totest$IDA_2_stage_1_prediction <- predict(gam_IDA2_stage1, newdata = df_totest)
+xts_totest$IDA_3_stage_1_prediction <- predict(gam_IDA3_stage1, newdata = df_totest)
+xts_totest$BM_stage_1_prediction <- predict(gam_BM_stage1, newdata = df_totest)
+
+xts_totest$IDA_1_stage_2_prediction <- predict(gam_IDA1_stage2, newdata = df_totest)
+xts_totest$IDA_2_stage_2_prediction <- predict(gam_IDA2_stage2, newdata = df_totest)
+xts_totest$IDA_3_stage_2_prediction <- predict(gam_IDA3_stage2, newdata = df_totest)
+xts_totest$BM_stage_2_prediction <- predict(gam_BM_stage2, newdata = df_totest)
+
+xts_totest$IDA_2_stage_3_prediction <- predict(gam_IDA2_stage3, newdata = df_totest)
+xts_totest$IDA_3_stage_3_prediction <- predict(gam_IDA3_stage3, newdata = df_totest)
+xts_totest$BM_stage_3_prediction <- predict(gam_BM_stage3, newdata = df_totest)
+
+xts_totest$IDA_3_stage_4_prediction <- predict(gam_IDA3_stage4, newdata = df_totest)
+xts_totest$BM_stage_4_prediction <- predict(gam_BM_stage4, newdata = df_totest)
+
+xts_totest$BM_stage_5_prediction <- predict(gam_BM_stage5, newdata = df_totest)
+
+# now just to set NA values for any IDA rows that aren't possible due to timings
+
+for (i in seq(1:dim(xts_totest)[1])) {
+  if (hour(index(xts_totest[i])) < 11 | hour(index(xts_totest[i])) >= 23) {
+    xts_totest$IDA_2_stage_1_prediction[[i]] = NA
+    xts_totest$IDA_2_stage_2_prediction[[i]] = NA
+    xts_totest$IDA_2_stage_3_prediction[[i]] = NA
+    
+  }
+  if (hour(index(xts_totest[i])) < 17 | hour(index(xts_totest[i])) >= 23) {
+    xts_totest$IDA_3_stage_1_prediction[[i]] = NA
+    xts_totest$IDA_3_stage_2_prediction[[i]] = NA
+    xts_totest$IDA_3_stage_3_prediction[[i]] = NA
+    xts_totest$IDA_3_stage_4_prediction[[i]] = NA
+    
+  }
+}
+
+  return(xts_totest)
+}
+
+implement_price_selection_model <- function(xts_object) {
+  
+prices <- c()
+
+# We should have all the values in the correct columns now, so no need to check the time periods any more
+# get the price in stages
+xts_totest <- xts_object
+for (i in seq(1:dim(xts_totest)[1])) {
+  
+  # stage 1: we have DAM price only
+  if (isTRUE(xts_totest$DAM_stage_1_prediction[[i]] <= min(c(xts_totest$IDA_1_stage_1_prediction[i], xts_totest$IDA_2_stage_1_prediction[i], xts_totest$IDA_3_stage_1_prediction[i], xts_totest$BM_stage_1_prediction[i]), na.rm = TRUE))) {
+    prices[[i]] = xts_totest$DA_Price[[i]]
+  }
+  # stage 2: we didn't buy the DAM price, holding out for later prices
+  else if (isTRUE(xts_totest$IDA_1_stage_2_prediction[[i]] <= min(c(xts_totest$IDA_2_stage_2_prediction[i], xts_totest$IDA_3_stage_2_prediction[i], xts_totest$BM_stage_2_prediction[i]), na.rm = TRUE))) {
+    prices[[i]] = xts_totest$IDA1_Price[[i]]
+  }
+  # stage 3: we didn't buy the IDA1 price either, holding out for later prices
+  else if (isTRUE(xts_totest$IDA_2_stage_3_prediction[[i]] <= min(c(xts_totest$IDA_3_stage_3_prediction[i], xts_totest$BM_stage_3_prediction[i]), na.rm = TRUE))) {
+    prices[[i]] = xts_totest$IDA2_Price[[i]]
+  }
+  # stage 4: we didn't buy the IDA 2 price, holding out for later prices
+  else if (isTRUE(xts_totest$IDA_3_stage_4_prediction[[i]] <= min(xts_totest$BM_stage_4_prediction[i], na.rm = TRUE))) {
+    prices[[i]] = xts_totest$IDA3_Price[[i]]
+  }
+  # stage 5: we only have BAM left - if we got this far it is because our predictions told us that BM should be cheaper than the previous actual prices
+  else {
+    prices[[i]] = xts_totest$BM_Price[[i]]
+  }
+
+}
+
+# print(table(markets)) # this can be useful to see this distribution of markets chosen
+xts_totest$prices_chosen <- prices
+
+return(xts_totest)
+}
+```
+
+Trying the function on the testing data
+```{r, warning=FALSE}
+# prepare the whole xts object
+all_data_part_1 <- prepare_dataframe(main_xts)
+# split into training and testing data
+sum(is.na(all_data_part_1$Actual_Wind_MW)) # checking we can use "actual wind" column as the data partition (sum of NA should be 0)
+in_train <- createDataPartition(all_data_part_1$Actual_Wind_MW, p=0.6, list = FALSE) # split is 60% to 40% and is randomly shuffled
+xts_totrain <- all_data_part_1[in_train,]
+xts_totest <- all_data_part_1[-in_train,]
+
+testing_data_xts_part_1 <- implement_price_selection_model(xts_totest)
+head(testing_data_xts_part_1)
+```
+
+Seeing the plot of the model on the testing data - bottom plot is the chosen price
+```{r fig.width=15, fig.height=6}
+autoplot.zoo(testing_data_xts_part_1[, c("DA_Price", "IDA1_Price", "IDA2_Price", "IDA3_Price", "BM_Price", "prices_chosen")], plot.type = "single", facets = NULL)
+autoplot.zoo(testing_data_xts_part_1[, c("DA_Price", "IDA1_Price", "IDA2_Price", "IDA3_Price", "BM_Price", "prices_chosen")])
+```
+
+Having a look at the mean of each market - see that the chosen price is lower than choosing any 1 market for every prediction  
+The average price is 40.3  
+```{r}
+print(paste("DA Price Mean:", round(mean(testing_data_xts_part_1$DA_Price), 3)))
+print(paste("IDA1 Price Mean:", round(mean(testing_data_xts_part_1$IDA1_Price), 3)))
+print(paste("IDA2 Price Mean:", round(mean(testing_data_xts_part_1$IDA2_Price, na.rm=TRUE), 3)))
+print(paste("IDA3 Price Mean:", round(mean(testing_data_xts_part_1$IDA3_Price, na.rm=TRUE), 3)))
+print(paste("BM Price Mean:", round(mean(testing_data_xts_part_1$BM_Price), 3)))
+
+# see that the mean of the price actually chosen is a fair bit lower
+print(paste("Chosen Prices Mean:", round(mean(testing_data_xts_part_1$prices_chosen, na.rm=TRUE), 3)))
+```
+
+Now trying the function all all the data, rather than just the testing data
+```{r, warning=FALSE}
+all_data_xts_part_1 <- implement_price_selection_model(all_data_part_1)
+```
+
+Bottom graph shows the prices actually chosen
+```{r fig.width=20, fig.height=10}
+autoplot.zoo(all_data_xts_part_1[, c("DA_Price", "IDA1_Price", "IDA2_Price", "IDA3_Price", "BM_Price", "prices_chosen")])
+```
+
+Over random selections of 100 half hour periods, this is the distribution of the mean value each day to be expected, with some summary stats  
+The mean is 40.69, the standard deviation is 3.21
+```{r, warning=FALSE}
+mean_prices = c()
+
+for (i in seq(1:1000)){
+xts_bootstrap_part_1 <- implement_price_selection_model(all_data_part_1[sample(1:dim(all_data_part_1)[1], size=100, replace=TRUE),])
+mean_prices[[i]] = mean(xts_bootstrap_part_1$prices_chosen)
+}
+
+print(summary(mean_prices))
+print(sd(mean_prices))
+hist(mean_prices)
+```
+
+It might be of interest to see whether a more conservative model (which would be expected to have a lower mean value but a lower standard deviation) would be a preferred model  
+In this model, a price will be chosen if 0.9 * predicted value is the minimum of all predicted values, rather than just the predicted value  
+Now defining a more conservative model - more likely to choose a "good enough" price rather than hold out for better  
+```{r}
+implement_price_selection_model_conservative <- function(xts_object) {
+  
+prices <- c()
+markets <- c()
+
+# We should have all the values in the correct columns now, so no need to check the time periods any more
+# get the price in stages
+xts_totest <- xts_object
+for (i in seq(1:dim(xts_totest)[1])) {
+  
+  # stage 1: we have DAM price only
+  if (isTRUE(xts_totest$DAM_stage_1_prediction[[i]] * 0.9 <= min(c(xts_totest$IDA_1_stage_1_prediction[i], xts_totest$IDA_2_stage_1_prediction[i], xts_totest$IDA_3_stage_1_prediction[i], xts_totest$BM_stage_1_prediction[i]), na.rm = TRUE))) {
+    prices[[i]] = xts_totest$DA_Price[[i]]
+    markets[[i]] = "DAM"
+  }
+  # stage 2: we didn't buy the DAM price, holding out for later prices
+  else if (isTRUE(xts_totest$IDA_1_stage_2_prediction[[i]] * 0.9 <= min(c(xts_totest$IDA_2_stage_2_prediction[i], xts_totest$IDA_3_stage_2_prediction[i], xts_totest$BM_stage_2_prediction[i]), na.rm = TRUE))) {
+    prices[[i]] = xts_totest$IDA1_Price[[i]]
+    markets[i] = "IDA1"
+  }
+  # stage 3: we didn't buy the IDA1 price either, holding out for later prices
+  else if (isTRUE(xts_totest$IDA_2_stage_3_prediction[[i]] * 0.9 <= min(c(xts_totest$IDA_3_stage_3_prediction[i], xts_totest$BM_stage_3_prediction[i]), na.rm = TRUE))) {
+    prices[[i]] = xts_totest$IDA2_Price[[i]]
+    markets[i] = "IDA2"
+  }
+  # stage 4: we didn't buy the IDA 2 price, holding out for later prices
+  else if (isTRUE(xts_totest$IDA_3_stage_4_prediction[[i]] * 0.9 <= min(xts_totest$BM_stage_4_prediction[i], na.rm = TRUE))) {
+    prices[[i]] = xts_totest$IDA3_Price[[i]]
+    markets[i] = "IDA3"
+  }
+  # stage 5: we only have BAM left - if we got this far it is because our predictions told us that BM should be cheaper than the previous actual prices
+  else {
+    prices[[i]] = xts_totest$BM_Price[[i]]
+    markets[i] = "BM"
+  }
+
+}
+
+# print(table(markets))
+xts_totest$prices_chosen <- prices
+xts_totest$markets_chosen <- markets
+
+return(xts_totest)
+}
+```
+
+Using a more conservative model   
+Over random selections of 100 half hour periods, this is the distribution of the mean value each day to be expected, with some summary stats   
+The standard deviation is ever so slightly lower, which is good, but the mean is significantly higher - the model is not worth the increase in the mean price  
+```{r, warning=FALSE}
+set.seed(42)
+mean_prices_conservative = c()
+
+for (i in seq(1:1000)){
+xts_bootstrap_part_1_cons <- implement_price_selection_model_conservative(all_data_part_1[sample(1:dim(all_data_part_1)[1], size=100, replace=TRUE),])
+mean_prices_conservative[[i]] = mean(xts_bootstrap_part_1_cons$prices_chosen)
+}
+
+print(summary(mean_prices_conservative))
+print(sd(mean_prices_conservative))
+hist(mean_prices_conservative)
+```
+
+
+# Part 2: Data without Forecast Variables
+
+
+Reading in the Data
+
+### Loading Data
+
+Reading in the data provided
+```{r}
+path_2 <- "QUB Data - Part 2.xlsx"
+
+excel_2 <- path_2 %>% 
+  excel_sheets() %>% 
+  set_names() %>% 
+  map(read_excel, path = path_2)
+```
+
+inspecting each tab in the data (wind)
+```{r}
+excel_2$Wind
+```
+
+inspecting each tab in the data (demand)
+```{r}
+excel_2$Demand
+```
+
+inspecting each tab in the data (actual prices)
+```{r}
+excel_2$`Actual Prices`
+```
+
+Joining data into one dataframe
+```{r}
+df_2 <- inner_join(excel_2$Wind, excel_2$Demand, by=c("Start Date"="Start Date", "Start Time 30 Minute Period" = "Start Time 30 Minute Period")) %>%
+  inner_join(excel_2$`Actual Prices`, by=c("Start Date"="Start Date", "Start Time 30 Minute Period" = "Time"))
+
+# renaming for simplicity
+names(df_2) <- c("Start_Date", "Start_Time_30_Minute_Period", "Actual_Wind_MW", "Actual_Demand_MW", "DA_Price", "IDA1_Price", "IDA2_Price", "IDA3_Price", "BM_Price")
+```
+
+
+
+Checking when prices are available for each auction period: "1" signifies that a price is available. We can see the DA price, IDA1 Price and BM price are always available, while IDA2 price is available from 11:00 to 22:30 inclusive, IDA3 price is available from 17:00 to 22:30 inclusive.  
+This is in line with the description of the data given in advance.
+```{r}
+names(df_2)
+times_of_day = unique(df_2 %>% select(Start_Time_30_Minute_Period)) %>% data.frame()
+names(df)
+DA_Price_Available <- unique(df_2 %>% filter(!is.na(DA_Price)) %>% select(Start_Time_30_Minute_Period)) %>% mutate("DA_Price_Available" = 1)
+IDA1_Price_Available <- unique(df_2 %>% filter(!is.na(IDA1_Price)) %>% select(Start_Time_30_Minute_Period)) %>% mutate("IDA1_Price_Available" = 1)
+IDA2_Price_Available <- unique(df_2 %>% filter(!is.na(IDA2_Price)) %>% select(Start_Time_30_Minute_Period)) %>% mutate("IDA2_Price_Available" = 1)
+IDA3_Price_Available <- unique(df_2 %>% filter(!is.na(IDA3_Price)) %>% select(Start_Time_30_Minute_Period)) %>% mutate("IDA3_Price_Available" = 1)
+BM_Price_Available <- unique(df_2 %>% filter(!is.na(BM_Price)) %>% select(Start_Time_30_Minute_Period)) %>% mutate("BM_Price_Available" = 1)
+
+
+times_of_day %>% full_join(DA_Price_Available, by=c("Start_Time_30_Minute_Period"="Start_Time_30_Minute_Period")) %>%
+  full_join(IDA1_Price_Available, by=c("Start_Time_30_Minute_Period"="Start_Time_30_Minute_Period")) %>% 
+  full_join(IDA2_Price_Available, by=c("Start_Time_30_Minute_Period"="Start_Time_30_Minute_Period")) %>% 
+  full_join(IDA3_Price_Available, by=c("Start_Time_30_Minute_Period"="Start_Time_30_Minute_Period")) %>% 
+  full_join(BM_Price_Available, by=c("Start_Time_30_Minute_Period"="Start_Time_30_Minute_Period"))
+  
+
+```
+
+manipulating dataframe to have a time compatible with POSIXCT format
+```{r}
+df_2$Start_Date <- df_2$Start_Date %>% str_replace_all("/", "-")
+df_2$joined_time <- paste(df_2$Start_Date, df_2$Start_Time_30_Minute_Period)
+
+df_2 <- df_2 %>% select(-Start_Date, -Start_Time_30_Minute_Period)
+
+df_2$joined_time <- as.character(df_2$joined_time)
+
+head(df_2)
+```
+Adding column for demand wind difference
+```{r}
+df_2$Demand_Wind_Diff <- df_2$Actual_Demand_MW - df_2$Actual_Wind_MW
+```
+
+
+### Dealing with missing values
+Brief check for outliers - there are no outliers in demand
+```{r}
+summary(df_2$Actual_Demand_MW)
+boxplot(df_2$Actual_Demand_MW)
+```
+
+### EDA
+
+Boxplots, denisty plots and histograms reveal very similar price distributions as in part 1  
+```{r}
+summary(df_2, fig.width=20, fig.height=20)
+df_2_stacked <- stack(df_2, select = c(DA_Price, IDA1_Price, IDA2_Price, IDA3_Price, BM_Price))
+ggplot(df_2_stacked, aes(ind, values, col=ind)) + geom_boxplot()
+
+```
+```{r, fig.width=20, fig.height=5}
+ggplot(df_2_stacked, aes(x=values, group=ind, fill=ind)) + geom_density(alpha=0.2)
+```
+
+```{r, fig.width=20, fig.height=10}
+ggplot(df_2_stacked, aes(x=values, group=ind, fill=ind)) + geom_histogram(bins=100) + facet_wrap(.~ind)
+```
+
+### Creating XTS object
+
+As before, the prices can be plotted to show trends, and prices pairplotted to show relationships 
+```{r}
+main_xts_2 <- xts(df_2[,-8], as.POSIXct(df_2[,8][[1,]], format="%d-%m-%Y %H:%M:%S")) # using the datetime column as an index before dropping the redundant column
+print(periodicity(main_xts_2))
+print(names(main_xts_2))
+
+head(main_xts_2)
+```
+
+```{r fig.width=20, fig.height=10}
+autoplot.zoo(main_xts_2[, c("BM_Price", "IDA1_Price", "IDA2_Price", "IDA3_Price", "DA_Price")]["2019-10-/2019-11-01"], plot.type = "single", facets = NULL )
+```
+```{r fig.width=20, fig.height=10}
+ggpairs(main_xts_2[, c("DA_Price", "IDA1_Price", "IDA2_Price", "IDA3_Price", "BM_Price")])
+```
+
+Once again creating more explanatory variables, some using lag, and seeing their relationships
+```{r}
+main_xts_2$time_index_half_hour_periods <- index(index(main_xts_2))
+main_xts_2$mean_all_prices <- rowMeans(main_xts_2[,c('DA_Price', 'IDA1_Price', 'IDA2_Price', 'IDA3_Price', 'BM_Price')], na.rm=TRUE)
+main_xts_2$prev_day_av_price <- lag(main_xts_2$mean_all_prices, 48L)
+main_xts_2$prev_day_av_price[1:48] <- main_xts_2$mean_all_prices[1:48] # unknown previous day's average price for first day of data, so just using mean
+
+main_xts_2$prev_week_av_price <- rollapply(as.zoo(main_xts_2$prev_day_av_price), 48*7, mean, partial = TRUE, align = "right") # average of last 7 days of available prices, (ignoring the previous day since those prices will not be available)
+
+main_xts_2 <- xts(main_xts_2, as.POSIXct(df_2$joined_time, format="%d-%m-%Y %H:%M:%S")) # have to remake the XTS as the rollapply resets te index
+
+```
+The relationships are very similar to part 1
+```{r, warning=FALSE, fig.width=20, fig.height=20}
+ggpairs(main_xts_2[, c("mean_all_prices", "Actual_Wind_MW", "Actual_Demand_MW")], title = "Relationships between Wind, Demand and Mean Price")
+```
+
+
+### Attempt to Forecast Demand Wind Difference
+
+Since the forecast demand and forecast wind variables are not available, we can attempt to model the demand wind difference using an autocorrelation model
+Define test and train dataset, this time they should be chronological so we can use an ARIMA model to predict the demand
+```{r}
+sum(is.na(main_xts_2$DA_Price)) # checking we can use "actual wind" column as the data partition
+
+main_xts_2_train <- main_xts_2[1:floor(0.6*length(main_xts_2$DA_Price)),]
+main_xts_2_test <- main_xts_2[round(0.6*length(main_xts_2$DA_Price)):length(main_xts_2$DA_Price),]
+
+# test to ensure train and test are split correctly
+length(main_xts_2$DA.Price) == length(main_xts_2_train$DA.Price) + length(main_xts_2_test$DA.Price)
+
+train_df_2 = data.frame(main_xts_2_train)
+test_df_2 = data.frame(main_xts_2_test)
+
+```
+
+#-------------------------------------------------------------------------------------------------------------------------
+## Modeling Net Demand using ARIMA(p, d, q)
+
+### Step 1
+Examine time plot, check for evidence on stationarity. If evidence of non-stationarity (the ACF tails off slowly) then take differences (difference between consecutive observations) until stationarity. The number of differences = d. Differencing is used to reduce trend or seasonality.
+
+For this data, d = 2 as the ACF shows stationarity after the second difference.
+```{r}
+plot(df_2$Demand_Wind_Diff, type="l")
+acf(df_2$Demand_Wind_Diff)
+
+#Tails off slowly so non stationary and take difference
+diff_1 <- diff(df_2$Demand_Wind_Diff)
+acf(diff_1)
+
+# Still not stationary as ACF at all lags outside the blue lines +-2/sqrt(n), take difference again
+diff_2 <- diff(diff_1)
+acf(diff_2)
+```
+
+
+After deciding d, examine ACF for possible indication of suitable AR MA
+* MA(q): ACF cuts off after q
+* AR(p): ACF tails off (faster than linearly)
+* ARMA(p, q): ACF tails off (faster than linearly)
+
+Based on the ACF for the second difference, the ACF cuts off after the 6^th^ lag. So possibly q= 6.
+
+### Step 2
+Examine PACF (partial autocorrelation coefficients) - the correlation between Y~t~ and Y~t+p~
+```{r}
+pacf(diff_2)
+```
+
+###Step 3
+Fit selected model.
+```{r}
+model_0_2_6 = arima(df_2$Demand_Wind_Diff, order = c(0, 2, 6))
+
+model_0_2_6
+
+tsdiag(model_0_2_6)
+```
+
+ACF of residual good but p-values are low.
+
+###Step 4
+Trial Overfitting:
+* p+1
+* q+1
+```{r}
+# Increase p 0->1
+# AIC 95241.7 better model
+model_1_2_6 = arima(df_2$Demand_Wind_Diff, order = c(1, 2, 6))
+model_1_2_6
+tsdiag(model_1_2_6)
+
+# Increase p 1->2
+# AIC 95214.51 slightly better
+model_2_2_6 = arima(df_2$Demand_Wind_Diff, order = c(2, 2, 6))
+model_2_2_6
+tsdiag(model_2_2_6)
+
+# Incease q 6->7
+# AIC 95184.17 better model
+model_2_2_7 = arima(df_2$Demand_Wind_Diff, order = c(2, 2, 7))
+model_2_2_7
+tsdiag(model_2_2_7)
+
+# Increase q 7->8
+# AIC 95182.5 slightly better ##
+model_2_2_8 = arima(df_2$Demand_Wind_Diff, order = c(2, 2, 8))
+model_2_2_8
+tsdiag(model_2_2_8)
+```
+
+
+```{r}
+# Increase q 8->9
+# AIC 95183.8 slightly worse
+model_2_2_9 = arima(df_2$Demand_Wind_Diff, order = c(2, 2, 9))
+model_2_2_9
+tsdiag(model_2_2_9)
+
+# Increase q 9->10
+# AIC 95185.32 slightly worse
+model_2_2_10 = arima(df_2$Demand_Wind_Diff, order = c(2, 2, 10))
+model_2_2_10
+tsdiag(model_2_2_10)
+
+# Increase p 2->3
+# AIC 95184.27 worse model
+model_3_2_8 = arima(df_2$Demand_Wind_Diff, order = c(3, 2, 8))
+model_3_2_8
+tsdiag(model_3_2_8)
+
+# Decrease  q 8->7
+# AIC 95181.55 best
+model_3_2_7 = arima(df_2$Demand_Wind_Diff, order = c(3, 2, 7))
+model_3_2_7
+tsdiag(model_3_2_7)
+
+# Decrease q 7-> 6
+#AIC 95205.44 worse
+model_3_2_6 = arima(df_2$Demand_Wind_Diff, order = c(3, 2, 6))
+model_3_2_6
+tsdiag(model_3_2_6)
+```
+
+### Step 5
+Choose model:
+The ARIMA(3, 2, 7) model produces the lowest AIC and so is the best model.
+
+Having selected the model, the future values can be predicted.  
+Running the model again on the training data, and use it to predict column for the testing data
+```{r warning=FALSE}
+train_df_2
+model_3_2_7 = arima(train_df_2$Demand_Wind_Diff, order = c(3, 2, 7))
+pred <- predict(model_3_2_7, n.ahead=length(test_df_2$DA_Price))
+
+
+main_xts_2_test$pred_demand_wind_diff <- c(pred$pred)
+
+```
+
+### Evaluating if the Arima Model is Suitable
+
+The standard deviation of the Demand Wind Difference column is 1343, and the RMSE of the predictions vs the Demand Wind Difference is 1648  
+This accuracy is too low to reliably use the ARIMA model to predict the Demand Wind Difference column, and it can be concluded that an ARIMA model is not suitable for the data.
+```{r}
+# - we really can't use autocorrelation to help with predictions
+print(summary(main_xts_2_test$Demand_Wind_Diff))
+print(sd(main_xts_2_test$Demand_Wind_Diff))
+print(paste("Root MSE between Predicted and Actual Values on the Test Data of:", RMSE(main_xts_2_test$pred_demand_wind_diff, main_xts_2_test$Demand_Wind_Diff)))
+
+```
+
+```{r fig.width=12, fig.height=3}
+autoplot.zoo(main_xts_2_test[, c("Demand_Wind_Diff", "pred_demand_wind_diff")], plot.type = "single", facets = NULL)
+```
+
+
+### Using Lagged Demand Wind Difference Variables
+
+To replace forecast, we can use two variables, the Demand Wind Difference lagged by one, and the average Demand Wind Difference over the previous 7 days
+```{r}
+main_xts_2$Demand_Wind_Diff_prev_day_av <- lag(main_xts_2$Demand_Wind_Diff, 48L)
+main_xts_2$Demand_Wind_Diff_prev_day_av[1:48] <- main_xts_2$Demand_Wind_Diff[1:48] # unknown previous day's wind-demand-diff for first day of data, so just using mean
+
+main_xts_2$Demand_Wind_Diff_prev_week_av <- rollapply(as.zoo(main_xts_2$Demand_Wind_Diff_prev_day_av), 48*7, mean, partial = TRUE, align = "right") # average of last 7 days of available demand_wind_differences, (ignoring the previous day since those prices will not be available)
+
+main_xts_2 <- xts(main_xts_2, as.POSIXct(df_2$joined_time, format="%d-%m-%Y %H:%M:%S")) # have to remake the XTS as the rollapply resets te index
+head(main_xts_2)
+```
+
+Redefining the train and test xts objects and dataframes using the new lagged variables, no need for chronological order now, so each after randomly shuffled as in part 1  
+```{r}
+set.seed(42)
+sum(is.na(main_xts_2$Actual_Wind_MW)) # checking we can use "actual wind" column as the data partition (sum of NA should be 0)
+in_train <- createDataPartition(main_xts_2$Actual_Wind_MW, p=0.6, list = FALSE) # split is 60% to 40% and is randomly shuffled
+main_xts_train_2 <- main_xts_2[in_train,]
+main_xts_test_2 <- main_xts_2[-in_train,]
+train_df_2 <- data.frame(main_xts_train_2)
+test_df_2 <- data.frame(main_xts_test_2)
+
+```
+
+
+### Proposed Replacements for Forecasting Variables
+
+Given that the Arima model cannot be used to adequately forecast the Demand Wind Difference column, the values for all price groups will have to be predicted without the forecast variable.  
+Using the newly introduced lagged demand wind difference variables results in a much lower variance explained, even though the new variables are significant
+
+For example, for the first GAM in stage 1, before any price information is obtained, the GAM to predict the DAM price had an R Squared Adjusted Value of 0.676  
+```{r}
+summary(gam_DAM_stage1)
+```
+
+While using the lagged Demand Wind Difference variables to replace forecasts results in a much lower R Squared Adjusted value of 0.393
+```{r}
+gam_DAM_2_stage_1 <- gam(DA_Price ~ s(Demand_Wind_Diff_prev_day_av) + s(Demand_Wind_Diff_prev_week_av) + s(prev_week_av_price) + s(prev_day_av_price) + s(time_index_half_hour_periods), data=train_df_2)
+summary(gam_DAM_2_stage_1)
+```
+
+However, for later stages, once some prices have been obtained, the new models hold up well. Comparing the stage 2 GAM to predict IDA1 from part 1 and the proposed stage 2 GAM to predict IDA1 using the lagged Demand Wind Difference variables reveals that they have nearly identical values for R Squared Adjusted.
+```{r}
+summary(gam_IDA1_stage2)
+```
+
+```{r}
+gam_IDA1_2_stage2 <- gam(IDA1_Price ~ s(Demand_Wind_Diff_prev_day_av) + s(Demand_Wind_Diff_prev_week_av) + s(DA_Price) + s(prev_week_av_price) + s(prev_day_av_price) + s(time_index_half_hour_periods), data=train_df_2)
+summary(gam_IDA1_2_stage2)
+```
+
+### Modelling Strategy
+
+The modelling strategy for part 2 will be the same iterative approach as part 1, but now using the new lagged Demand Wind Diff variables instead of the forecast variables.
+
+```{r}
+names(train_df_2)
+
+# This is what you would expect to use for the GAMs: all the available price information, the most recent forecasts, the average price over the last 7 days, the previous day's average price and the time index
+# however performing a summary reveals that many of these variables can be removed
+# ----------------------------------
+
+gam_DAM_2_stage1 <- gam(DA_Price ~ s(Demand_Wind_Diff_prev_day_av) + s(Demand_Wind_Diff_prev_week_av) + s(prev_week_av_price) + s(prev_day_av_price) + s(time_index_half_hour_periods), data=train_df_2)
+gam_IDA1_2_stage1 <- gam(IDA1_Price ~ s(Demand_Wind_Diff_prev_day_av) + s(Demand_Wind_Diff_prev_week_av) + s(prev_week_av_price) + s(prev_day_av_price) + s(time_index_half_hour_periods), data=train_df_2)
+gam_IDA2_2_stage1 <- gam(IDA2_Price ~ s(Demand_Wind_Diff_prev_day_av) + s(Demand_Wind_Diff_prev_week_av) + s(prev_week_av_price) + s(prev_day_av_price) + s(time_index_half_hour_periods), data=train_df_2)
+gam_IDA3_2_stage1 <- gam(IDA3_Price ~ s(Demand_Wind_Diff_prev_day_av) + s(Demand_Wind_Diff_prev_week_av) + s(prev_week_av_price) + s(prev_day_av_price) + s(time_index_half_hour_periods), data=train_df_2)
+gam_BM_2_stage1 <- gam(BM_Price ~ s(Demand_Wind_Diff_prev_day_av) + s(Demand_Wind_Diff_prev_week_av) + s(prev_week_av_price) + s(prev_day_av_price) + s(time_index_half_hour_periods), data=train_df_2)
+
+gam_IDA1_2_stage2 <- gam(IDA1_Price ~ s(DA_Price) + s(Demand_Wind_Diff_prev_day_av) + s(Demand_Wind_Diff_prev_week_av)  + s(prev_week_av_price) + s(prev_day_av_price) + s(time_index_half_hour_periods), data=train_df_2)
+gam_IDA2_2_stage2 <- gam(IDA2_Price ~ s(DA_Price) + s(Demand_Wind_Diff_prev_day_av) + s(Demand_Wind_Diff_prev_week_av)  + s(prev_week_av_price) + s(prev_day_av_price) + s(time_index_half_hour_periods), data=train_df_2)
+gam_IDA3_2_stage2 <- gam(IDA3_Price ~ s(DA_Price) + s(Demand_Wind_Diff_prev_day_av) + s(Demand_Wind_Diff_prev_week_av) + s(prev_week_av_price) + s(prev_day_av_price) + s(time_index_half_hour_periods), data=train_df_2)
+gam_BM_2_stage2 <- gam(BM_Price ~ s(DA_Price) + s(Demand_Wind_Diff_prev_day_av) + s(Demand_Wind_Diff_prev_week_av) + s(prev_week_av_price) + s(prev_day_av_price) + s(time_index_half_hour_periods), data=train_df_2)
+
+gam_IDA2_2_stage3 <- gam(IDA2_Price ~ s(DA_Price) + s(IDA1_Price) + s(Demand_Wind_Diff_prev_day_av) + s(Demand_Wind_Diff_prev_week_av)  + s(prev_week_av_price) + s(prev_day_av_price) + s(time_index_half_hour_periods), data=train_df_2)
+gam_IDA3_2_stage3 <- gam(IDA3_Price ~ s(DA_Price) + s(IDA1_Price) + s(Demand_Wind_Diff_prev_day_av) + s(Demand_Wind_Diff_prev_week_av) + s(prev_week_av_price) + s(prev_day_av_price) + s(time_index_half_hour_periods), data=train_df_2)
+gam_BM_2_stage3 <- gam(BM_Price ~ s(DA_Price) + s(IDA1_Price) + s(Demand_Wind_Diff_prev_day_av) + s(Demand_Wind_Diff_prev_week_av)  + s(prev_week_av_price) + s(prev_day_av_price) + s(time_index_half_hour_periods), data=train_df_2) 
+
+gam_IDA3_2_stage4 <- gam(IDA3_Price ~ s(DA_Price) + s(IDA1_Price) + s(Demand_Wind_Diff_prev_day_av) + s(Demand_Wind_Diff_prev_week_av)  + s(prev_week_av_price) + s(prev_day_av_price) + s(time_index_half_hour_periods), data=train_df_2) # BM cannot use IDA2 and IDA3 variables here since the GAM will create NAs when BM price should be available for prediction
+gam_BM_2_stage4 <- gam(BM_Price ~ s(DA_Price) + s(IDA1_Price) + s(Demand_Wind_Diff_prev_day_av) + s(Demand_Wind_Diff_prev_week_av)  + s(prev_week_av_price) + s(prev_day_av_price) + s(time_index_half_hour_periods), data=train_df_2) # BM cannot use IDA2 and IDA3 variables here since the GAM will create NAs when BM price should be available for prediction
+
+gam_BM_2_stage5 <- gam(BM_Price ~ s(DA_Price) + s(IDA1_Price) + s(Demand_Wind_Diff_prev_day_av) + s(Demand_Wind_Diff_prev_week_av)  + s(prev_week_av_price) + s(prev_day_av_price) + s(time_index_half_hour_periods), data=train_df_2) # BM cannot use IDA2 and IDA3 variables here since the GAM will create NAs when BM price should be available for prediction
+
+# ----------------------------------
+# checking to see if there are any varaibles that are not significant in each GAM
+
+summary(gam_DAM_2_stage1)
+summary(gam_IDA1_2_stage1)
+summary(gam_IDA2_2_stage1)
+summary(gam_IDA3_2_stage1) 
+summary(gam_BM_2_stage1) 
+
+summary(gam_IDA1_2_stage2)
+summary(gam_IDA2_2_stage2) # prev_day_av_price insignificant
+summary(gam_IDA3_2_stage2) # Demand_Wind_Diff_prev_day_av, prev_day_av_price insignificant
+summary(gam_BM_2_stage2) # prev day av price insignificant 
+
+summary(gam_IDA2_2_stage3)
+summary(gam_IDA3_2_stage3) # prev_week_av_price insignificant
+summary(gam_BM_2_stage3) # prev_week_av_price insignificant
+
+summary(gam_IDA3_2_stage4) #DA Price ,prev_week_av_price insignificant
+summary(gam_BM_2_stage4)
+
+summary(gam_BM_2_stage5)
+
+# ----------------------------------
+# redefining some of the GAMs using only their significant variables
+
+
+gam_IDA2_2_stage2 <- gam(IDA2_Price ~ s(DA_Price) + s(Demand_Wind_Diff_prev_day_av) + s(Demand_Wind_Diff_prev_week_av) + s(prev_day_av_price) + s(time_index_half_hour_periods), data=train_df_2)
+
+gam_IDA3_2_stage2 <- gam(IDA3_Price ~ s(DA_Price) + s(Demand_Wind_Diff_prev_week_av) + s(prev_week_av_price) + s(time_index_half_hour_periods), data=train_df_2)
+
+gam_BM_2_stage2 <- gam(BM_Price ~ s(DA_Price) + s(Demand_Wind_Diff_prev_day_av) + s(Demand_Wind_Diff_prev_week_av) + s(Demand_Wind_Diff_prev_week_av) + s(time_index_half_hour_periods), data=train_df_2)
+
+
+gam_IDA3_2_stage3 <- gam(IDA3_Price ~ s(DA_Price) + s(IDA1_Price) + s(Demand_Wind_Diff_prev_day_av) + s(Demand_Wind_Diff_prev_week_av) + s(prev_day_av_price) + s(time_index_half_hour_periods), data=train_df_2)
+
+gam_BM_2_stage3 <- gam(BM_Price ~ s(DA_Price) + s(IDA1_Price) + s(Demand_Wind_Diff_prev_day_av) + s(Demand_Wind_Diff_prev_week_av) + s(prev_day_av_price) + s(time_index_half_hour_periods), data=train_df_2) 
+
+
+gam_IDA3_2_stage4 <- gam(IDA3_Price ~  s(IDA1_Price) + s(Demand_Wind_Diff_prev_day_av) + s(Demand_Wind_Diff_prev_week_av) + s(prev_day_av_price) + s(time_index_half_hour_periods), data=train_df_2) # BM cannot use IDA2 and IDA3 variables here since the GAM will create NAs when BM price should be available for prediction
+
+# all variables are now significant
+summary(gam_DAM_2_stage1)
+summary(gam_IDA1_2_stage1)
+summary(gam_IDA2_2_stage1)
+summary(gam_IDA3_2_stage1)
+summary(gam_BM_2_stage1)
+
+summary(gam_IDA1_2_stage2)
+summary(gam_IDA2_2_stage2)
+summary(gam_IDA3_2_stage2)
+summary(gam_BM_2_stage2)
+
+summary(gam_IDA2_2_stage3)
+summary(gam_IDA3_2_stage3)
+summary(gam_BM_2_stage3)
+
+summary(gam_IDA3_2_stage4)
+summary(gam_BM_2_stage4)
+
+summary(gam_BM_2_stage5)
+```
+
+Since the predictions are based on different variables, a new function is used to prepare the dataframe from an xts object
+```{r, warning=FALSE}
+
+prepare_dataframe_2 <- function(xts_object){
+  xts_totest <- xts_object
+  xts_totest$time_index_half_hour_periods <- index(index(xts_totest))
+  xts_totest$mean_all_prices <- rowMeans(xts_totest[,c('DA_Price', 'IDA1_Price', 'IDA2_Price', 'IDA3_Price', 'BM_Price')], na.rm=TRUE)
+  xts_totest$prev_day_av_price <- lag(xts_totest$mean_all_prices, 48L)
+  xts_totest$prev_day_av_price[1:48] <- xts_totest$mean_all_prices[1:48] # unknown previous day's average price for first day of data, so just using mean
+  xts_totest$prev_week_av_price <- rollapply(as.zoo(xts_totest$prev_day_av_price), 48*7, mean, partial = TRUE, align = "right") # average of last 7 days of available prices, (ignoring the previous day since those prices will not be available)
+
+  # new variables to replace forecast
+  xts_totest$Demand_Wind_Diff = xts_totest$Actual_Demand_MW - xts_totest$Actual_Wind_MW
+  ##########
+  xts_totest$Demand_Wind_Diff_prev_day_av <- lag(xts_totest$Demand_Wind_Diff, 48L)
+  xts_totest$Demand_Wind_Diff_prev_day_av[1:48] <- xts_totest$Demand_Wind_Diff[1:48] # unknown previous day's wind-demand-diff for first day of data, so just using mean
+  df_totest <- data.frame(xts_totest)
+  df_totest$date_time <- index(xts_totest) # important to make this row or can't use ifelse when making predictions to put NULL in for certain hours
+  
+  xts_totest$Demand_Wind_Diff_prev_week_av <- rollapply(as.zoo(xts_totest$Demand_Wind_Diff_prev_day_av), 48*7, mean, partial = TRUE, align = "right") # average of last 7 days of available demand_wind_differences, (ignoring the previous day since those prices will not be available)
+
+  xts_totest <- xts(xts_totest, as.POSIXct(df_totest$date_time, format="%d-%m-%Y %H:%M:%S")) # have to remake the XTS as the rollapply resets te index
+head(main_xts_2)
+  df_totest <- data.frame(xts_totest) # have to redefine
+
+
+# make columns first
+xts_totest$DAM_stage_1_prediction <- predict(gam_DAM_2_stage1, newdata = df_totest)
+xts_totest$IDA_1_stage_1_prediction <- predict(gam_IDA1_2_stage1, newdata = df_totest)
+xts_totest$IDA_2_stage_1_prediction <- predict(gam_IDA2_2_stage1, newdata = df_totest)
+xts_totest$IDA_3_stage_1_prediction <- predict(gam_IDA3_2_stage1, newdata = df_totest)
+xts_totest$BM_stage_1_prediction <- predict(gam_BM_2_stage1, newdata = df_totest)
+
+xts_totest$IDA_1_stage_2_prediction <- predict(gam_IDA1_2_stage2, newdata = df_totest)
+xts_totest$IDA_2_stage_2_prediction <- predict(gam_IDA2_2_stage2, newdata = df_totest)
+xts_totest$IDA_3_stage_2_prediction <- predict(gam_IDA3_2_stage2, newdata = df_totest)
+xts_totest$BM_stage_2_prediction <- predict(gam_BM_2_stage2, newdata = df_totest)
+
+xts_totest$IDA_2_stage_3_prediction <- predict(gam_IDA2_2_stage3, newdata = df_totest)
+xts_totest$IDA_3_stage_3_prediction <- predict(gam_IDA3_2_stage3, newdata = df_totest)
+xts_totest$BM_stage_3_prediction <- predict(gam_BM_2_stage3, newdata = df_totest)
+
+xts_totest$IDA_3_stage_4_prediction <- predict(gam_IDA3_2_stage4, newdata = df_totest)
+xts_totest$BM_stage_4_prediction <- predict(gam_BM_2_stage4, newdata = df_totest)
+
+xts_totest$BM_stage_5_prediction <- predict(gam_BM_2_stage5, newdata = df_totest)
+
+# now just to set NA values for any IDA rows that aren't possible due to timings
+
+for (i in seq(1:dim(xts_totest)[1])) {
+  if (hour(index(xts_totest[i])) < 11 | hour(index(xts_totest[i])) >= 23) {
+    xts_totest$IDA_2_stage_1_prediction[[i]] = NA
+    xts_totest$IDA_2_stage_2_prediction[[i]] = NA
+    xts_totest$IDA_2_stage_3_prediction[[i]] = NA
+    
+  }
+  if (hour(index(xts_totest[i])) < 17 | hour(index(xts_totest[i])) >= 23) {
+    xts_totest$IDA_3_stage_1_prediction[[i]] = NA
+    xts_totest$IDA_3_stage_2_prediction[[i]] = NA
+    xts_totest$IDA_3_stage_3_prediction[[i]] = NA
+    xts_totest$IDA_3_stage_4_prediction[[i]] = NA
+    
+  }
+}
+
+  return(xts_totest)
+}
+
+# We don't need a new function for finding the cheapest prices, we can reuse the one used in part 1
+```
+
+### Results
+Trying the function on the testing data
+```{r, warning=FALSE}
+set.seed(42)
+# prepare the whole xts object
+all_data_part_2 <- prepare_dataframe_2(main_xts_2)
+
+# split into training and testing data
+sum(is.na(all_data_part_2$Actual_Wind_MW)) # checking we can use "actual wind" column as the data partition (sum of NA should be 0)
+in_train <- createDataPartition(all_data_part_2$Actual_Wind_MW, p=0.6, list = FALSE) # split is 60% to 40% and is randomly shuffled
+xts_totrain_part_2 <- all_data_part_2[in_train,]
+xts_totest_part_2 <- all_data_part_2[-in_train,]
+
+testing_data_xts_part_2 <- implement_price_selection_model(xts_totest_part_2)
+head(testing_data_xts_part_2)
+```
+
+Seeing the plot of the model on the testing data - bottom plot is the chosen price
+```{r fig.width=20, fig.height=6}
+autoplot.zoo(testing_data_xts_part_2[, c("DA_Price", "IDA1_Price", "IDA2_Price", "IDA3_Price", "BM_Price", "prices_chosen")], plot.type = "single", facets = NULL)
+autoplot.zoo(testing_data_xts_part_2[, c("DA_Price", "IDA1_Price", "IDA2_Price", "IDA3_Price", "BM_Price", "prices_chosen")])
+```
+
+Having a look at the mean of each market - see that the chosen price mean is low
+```{r}
+print(paste("DA Price mean:", round(mean(testing_data_xts_part_2$DA_Price),3)))
+print(paste("IDA1 Price mean:", round(mean(testing_data_xts_part_2$IDA1_Price), 3)))
+print(paste("IDA2 Price mean:",round(mean(testing_data_xts_part_2$IDA2_Price, na.rm=TRUE), 3)))
+print(paste("IDA3 Price mean:",round(mean(testing_data_xts_part_2$IDA3_Price, na.rm=TRUE), 3)))
+print(paste("BM Price mean:",round(mean(testing_data_xts_part_2$BM_Price), 3)))
+# see that the mean of the price actually chosen is a fair bit lower
+print(paste("Chosen Price mean:",round(mean(testing_data_xts_part_2$prices_chosen, na.rm=TRUE), 3)))
+```
+
+
+```{r, warning=FALSE}
+all_data_xts_part_2 <- implement_price_selection_model(all_data_part_2)
+```
+
+Bottom graph is the prices actually chosen - looks good
+```{r fig.width=12, fig.height=6}
+autoplot.zoo(all_data_xts_part_2[, c("DA_Price", "IDA1_Price", "IDA2_Price", "IDA3_Price", "BM_Price", "prices_chosen")], plot.type = "single", facets = NULL)
+autoplot.zoo(all_data_xts_part_2[, c("DA_Price", "IDA1_Price", "IDA2_Price", "IDA3_Price", "BM_Price", "prices_chosen")])
+```
+
+Over 100 games, this is the distribution of the mean value each day to be expected, with some summary stats
+```{r, warning=FALSE}
+set.seed(42)
+mean_prices = c()
+
+for (i in seq(1:1000)){
+xts_bootstrap_part_2 <- implement_price_selection_model(all_data_part_2[sample(1:dim(all_data_part_2)[1], size=100, replace=TRUE),])
+mean_prices[[i]] = mean(xts_bootstrap_part_2$prices_chosen)
+}
+
+print(summary(mean_prices))
+print(sd(mean_prices))
+hist(mean_prices)
+```
+
+Using a more conservative model  
+Over 100 games, this is the distribution of the mean value each day to be expected, with some summary stats 
+The standard deviation is ever so slightly lower, which is good, but the mean is significantly higher - not worth the increase in price
+```{r, warning=FALSE}
+mean_prices_conservative_part_2 = c()
+
+for (i in seq(1:1000)){
+xts_bootstrap_part_2_cons <- implement_price_selection_model_conservative(all_data_part_2[sample(1:dim(all_data_part_2)[1], size=100, replace=TRUE),])
+mean_prices_conservative_part_2[[i]] = mean(xts_bootstrap_part_2_cons$prices_chosen)
+}
+
+print(summary(mean_prices_conservative_part_2))
+print(sd(mean_prices_conservative_part_2))
+hist(mean_prices_conservative_part_2)
+```
+
+
+### Conclusions
+
+The following final models are proposed:    
+  
+  
+**Part 1**: A series of models using forecast variables for wind and demand, the time index and additional lagged price variables are used  
+These are used iteratively, recalibrating as prices in each market become available    
+Over 100 randomly chosen energy hours, a mean energy price of 40.71 and a standard deviation of 3.3, is expected  
+This mean value is approximately normally distributed  
+```{r}
+set.seed(42)
+# prepare the whole xts object
+all_data_part_1_model_1 <- prepare_dataframe(main_xts)
+
+in_train_part_1 <- createDataPartition(all_data_part_1_model_1$Actual_Wind_MW, p=0.6, list = FALSE) # split is 60% to 40% and is randomly shuffled
+training_data_xts_part_1_model_1 <- all_data_part_1_model_1[in_train_part_1,]
+testing_data_xts_part_1_model_1 <- all_data_part_1_model_1[-in_train_part_1,]
+
+mean_prices = c()
+for (i in seq(1:10000)){
+xts_bootstrap_part_1 <- implement_price_selection_model(testing_data_xts_part_1_model_1[sample(1:dim(testing_data_xts_part_1_model_1)[1], size=100, replace=TRUE),])
+mean_prices[[i]] = mean(xts_bootstrap_part_1$prices_chosen)
+}
+
+print(summary(mean_prices))
+print(sd(mean_prices))
+hist(mean_prices)
+
+
+```
+  
+**Part 2**: A series of models using the time index and lagged Demand Wind Difference variables to replace the removed forecasting variables are used   
+These are used iteratively, recalibrating as prices in each market become available    
+Over 100 randomly chosen energy hours, a mean energy price of 40.25 and a standard deviation of 3.17, is expected  
+This mean value is approximately normally distributed  
+
+```{r}
+set.seed(42)
+
+all_data_part_2_model_2 <- prepare_dataframe_2(main_xts_2)
+
+
+in_train_part_2 <- createDataPartition(all_data_part_2_model_2$Actual_Wind_MW, p=0.6, list = FALSE) # split is 60% to 40% and is randomly shuffled
+training_data_xts_part_2_model_2 <- all_data_part_1_model_1[in_train_part_2,]
+testing_data_xts_part_2_model_2 <- all_data_part_1_model_1[-in_train_part_2,]
+
+
+mean_prices_2 = c()
+for (i in seq(1:10000)){
+xts_bootstrap_part_2 <- implement_price_selection_model(testing_data_xts_part_2_model_2[sample(1:dim(testing_data_xts_part_2_model_2)[1], size=100, replace=TRUE),])
+mean_prices_2[[i]] = mean(xts_bootstrap_part_2$prices_chosen)
+}
+
+print(summary(mean_prices_2))
+print(sd(mean_prices_2))
+hist(mean_prices_2)
+```
+
+
